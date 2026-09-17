@@ -1,0 +1,309 @@
+┌─────────────────────────────────────────────────────────────┐
+│                     Presentation Layer                       │
+│  (Flutter UI: Dashboard, Servers, Settings, Profiles)        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ (state via Riverpod/Bloc)
+┌───────────────────────────▼─────────────────────────────────┐
+│                      Application Core                        │
+│  ConnectionManager · ServerSelector · ProfileService         │
+│  SettingsService · AuthService · TelemetryService            │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│                    VPN Engine (abstract)                     │
+│   VpnEngine interface                                        │
+│   ├─ WireGuardAdapter                                        │
+│   ├─ OpenVpnAdapter                                          │
+│   └─ Ikev2Adapter                                            │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ (FFI / MethodChannel / native)
+┌───────────────────────────▼─────────────────────────────────┐
+│                Platform Layer (per OS)                       │
+│  Android: VpnService · iOS/macOS: NetworkExtension           │
+│  Windows: WFP + wireguard-go · Linux: netlink + wg-quick     │
+└─────────────────────────────────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│                     Backend (server-side)                    │
+│  API Gateway · Auth · Server Registry · Health · Config      │
+└─────────────────────────────────────────────────────────────┘Layer Choice Why
+Cross-platform UI Flutter 3.x (Dart) One codebase for Android/iOS/Windows/macOS/Linux
+State management Riverpod Testable, no BuildContext coupling
+Local storage SQLite + SQLCipher, flutter_secure_storage Encrypted profiles & keys
+VPN core (WireGuard) wireguard-go (userspace) or WireGuardKit / wireguard-windows Battle-tested
+VPN core (OpenVPN) OpenVPN3 library Official, audited
+VPN core (IKEv2) OS APIs (Android Ikev2VpnProfile, iOS NEVPNProtocolIKEv2, Windows VpnManagementAgent) Leverage OS crypto
+Backend Go (net/http + chi) or Rust (axum) Performance + safety
+Backend DB PostgreSQL Relational integrity for accounts/devices/servers
+Cache/queue Redis Session + health metrics
+Auth OIDC + Argon2id password hashing, JWT access + refresh rotation Standard, safe
+Telemetry OpenTelemetry → self-hosted Vendor-neutral
+CI/CD GitHub Actions, reproducible builds, SBOM (Syft) Supply chain hygienevpn_client/
+├── lib/
+│   ├── main.dart
+│   ├── app.dart
+│   ├── core/
+│   │   ├── connection/
+│   │   │   ├── connection_manager.dart
+│   │   │   ├── connection_state.dart
+│   │   │   └── auto_reconnect.dart
+│   │   ├── server/
+│   │   │   ├── server_registry.dart
+│   │   │   ├── server_model.dart
+│   │   │   └── server_selector.dart
+│   │   ├── vpn_engine/
+│   │   │   ├── vpn_engine.dart          # abstract interface
+│   │   │   ├── wireguard_adapter.dart
+│   │   │   ├── openvpn_adapter.dart
+│   │   │   └── ikev2_adapter.dart
+│   │   ├── security/
+│   │   │   ├── kill_switch.dart
+│   │   │   ├── dns_manager.dart
+│   │   │   └── key_store.dart
+│   │   ├── profiles/
+│   │   │   ├── profile_model.dart
+│   │   │   └── profile_service.dart
+│   │   ├── settings/
+│   │   │   └── settings_service.dart
+│   │   ├── auth/
+│   │   │   └── auth_service.dart
+│   │   └── logging/
+│   │       └── logger.dart              # never logs secrets
+│   ├── features/
+│   │   ├── dashboard/
+│   │   ├── servers/
+│   │   ├── settings/
+│   │   ├── profiles/
+│   │   └── privacy/
+│   └── platform/
+│       ├── vpn_platform.dart            # abstract
+│       ├── android/
+│       ├── ios/
+│       ├── windows/
+│       ├── macos/
+│       └── linux/
+├── android/  ios/  windows/  macos/  linux/
+├── test/                                 # unit + widget
+└── integration_test/enum VpnProtocol { wireguard, openvpn, ikev2 }
+
+enum ConnectionStatus { disconnected, connecting, connected, reconnecting, error }
+
+class VpnConfig {
+  final String serverId;
+  final VpnProtocol protocol;
+  final Map<String, dynamic> parameters; // never logged
+  final DnsConfig dns;
+  final bool killSwitch;
+}
+
+abstract class VpnEngine {
+  Future<void> prepare();
+  Future<void> connect(VpnConfig config);
+  Future<void> disconnect();
+  Stream<ConnectionStatus> get statusStream;
+  Future<VpnStats> stats();
+  Future<void> dispose();
+}
+
+class VpnStats {
+  final String? vpnIp;
+  final Duration connectedFor;
+  final int bytesUp;
+  final int bytesDown;
+  final int latencyMs;
+  final VpnProtocol protocol;
+}abstract class VpnPlatform {
+  Future<bool> requestPermission();
+  Future<void> startTunnel(VpnConfig config);
+  Future<void> stopTunnel();
+  Future<NetworkType> currentNetworkType();
+  Stream<NetworkType> networkChanges();
+  Future<void> applyKillSwitch(bool enabled);
+  Future<void> applyDns(DnsConfig dns);
+}class ConnectionManager {
+  final VpnEngine _engine;
+  final ServerRegistry _servers;
+  final SettingsService _settings;
+  final KillSwitch _killSwitch;
+  final DnsManager _dns;
+
+  ConnectionStatus _status = ConnectionStatus.disconnected;
+
+  Future<void> connect({String? serverId}) async {
+    _status = ConnectionStatus.connecting;
+    final server = serverId != null
+        ? _servers.byId(serverId)
+        : await ServerSelector.pickBest(_servers, _settings);
+
+    final cfg = VpnConfig(
+      serverId: server.id,
+      protocol: _settings.preferredProtocol ?? server.recommendedProtocol,
+      parameters: await _servers.fetchRuntimeConfig(server.id),
+      dns: _settings.dns,
+      killSwitch: _settings.killSwitch,
+    );
+
+    if (_settings.killSwitch) await _killSwitch.arm();
+    await _dns.apply(cfg.dns);
+    await _engine.connect(cfg);
+    _status = ConnectionStatus.connected;
+  }
+
+  Future<void> disconnect() async {
+    await _engine.disconnect();
+    await _killSwitch.disarm();
+    _status = ConnectionStatus.disconnected;
+  }
+}┌─────────────────────────────┐
+│        VPN STATUS           │
+│        Disconnected         │
+│                             │
+│        LOCATION             │
+│        Automatic            │
+│                             │
+│        PROTOCOL             │
+│        Automatic            │
+│                             │
+│        IP ADDRESS           │
+│        Not connected        │
+│                             │
+│     ╭──────────────╮        │
+│     │   CONNECT    │        │
+│     ╰──────────────╯        │
+└─────────────────────────────┘VPN STATUS      Connected
+LOCATION        Amsterdam #3
+PROTOCOL        WireGuard
+IP ADDRESS      10.7.0.42
+CONNECTED FOR   00:14:22
+↓ 12.4 Mb/s     ↑ 3.1 Mb/s
+PING            28 ms
+DATA            412 MB ↓ / 88 MB ↑score = w1 * normalized(latency)
+      + w2 * normalized(load)
+      + w3 * (1 - reliability)
+      + w4 * normalized(geographicDistance)
+      + w5 * protocolPenaltyclass ServerSelector {
+  static Future<Server> pickBest(
+      ServerRegistry reg, SettingsService settings) async {
+    final candidates = reg.authorized().where((s) =>
+        s.supports(settings.preferredProtocol ?? s.recommendedProtocol));
+    if (candidates.isEmpty) throw NoServerAvailable();
+
+    Server? best;
+    double bestScore = double.infinity;
+    for (final s in candidates) {
+      final score =
+          0.35 * s.latencyNorm +
+          0.25 * s.loadNorm +
+          0.20 * (1 - s.reliability) +
+          0.15 * s.distanceNorm +
+          0.05 * (s.recommendedProtocol == settings.preferredProtocol ? 0 : 1);
+      if (score < bestScore) { bestScore = score; best = s; }
+    }
+    return best!;
+  }
+}Method Path Purpose
+POST /auth/register Create account (email + Argon2id)
+POST /auth/login Issue access + refresh JWT
+POST /auth/refresh Rotate refresh token
+POST /auth/reset Password reset via email
+GET /me Profile + subscription status
+GET /devices List devices
+POST /devices Register device (public key)
+DELETE /devices/{id} Revoke device
+GET /servers Authorized server list (public metadata)
+GET /servers/{id}/config Short-lived, per-device runtime config (WireGuard/OVPN)
+GET /servers/{id}/health Load, latency, uptime
+POST /profiles Sync encrypted profile blob (optional){
+  "server_id": "ams-03",
+  "protocol": "wireguard",
+  "endpoint": "ams-03.vpn.example.com:51820",
+  "server_public_key": "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+  "allowed_ips": ["0.0.0.0/0", "::/0"],
+  "dns": ["10.7.0.1"],
+  "expires_at": "2025-01-01T12:05:00Z",
+  "keepalive": 25
+}CREATE TABLE users (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email         CITEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,           -- Argon2id
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  subscription  TEXT NOT NULL DEFAULT 'free'
+);
+
+CREATE TABLE devices (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      UUID REFERENCES users(id) ON DELETE CASCADE,
+  name         TEXT,
+  wg_pubkey    TEXT,                      -- only public keys stored
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen    TIMESTAMPTZ,
+  revoked      BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE TABLE servers (
+  id            TEXT PRIMARY KEY,        -- "ams-03"
+  country       TEXT NOT NULL,
+  city          TEXT NOT NULL,
+  endpoint      TEXT NOT NULL,
+  protocols     TEXT[] NOT NULL,         -- {'wireguard','openvpn'}
+  capacity      INT NOT NULL,
+  enabled       BOOLEAN NOT NULL DEFAULT true,
+  wg_pubkey     TEXT
+);
+
+CREATE TABLE server_health (
+  server_id   TEXT REFERENCES servers(id),
+  ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  load_pct    REAL NOT NULL,
+  latency_ms  INT  NOT NULL,
+  up          BOOLEAN NOT NULL,
+  PRIMARY KEY (server_id, ts)
+);
+
+CREATE TABLE refresh_tokens (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
+  device_id   UUID REFERENCES devices(id) ON DELETE CASCADE,
+  token_hash  BYTEA NOT NULL,            -- SHA-256 of the token
+  expires_at  TIMESTAMPTZ NOT NULL,
+  revoked     BOOLEAN NOT NULL DEFAULT false
+);Concern Mitigation
+Key storage Private keys in OS keystore (Keystore / Keychain / DPAPI) + SQLCipher
+Config tampering HMAC over locally-stored profile blobs
+Cert validation Pinned TLS to backend; WireGuard uses Noise; OpenVPN uses tls-verify
+Random keys OS CSPRNG (Random.secure() / SecRandomCopyBytes / BCryptGenRandom)
+Auth Argon2id (t=3, m=64MB, p=4); refresh token rotation; device binding
+Errors Never surface keys/tokens; structured error codes with human messages
+Supply chain Pinned deps, SBOM, reproducible builds, signed releasesenum DnsStatus { verified, unverified, leakDetected, disabled }class AutoReconnect {
+  static const delays = [1, 2, 5, 10, 30]; // seconds, then stay at 30
+  int attempt = 0;
+
+  Future<void> onEvent(ConnectionManager mgr, ReconnectTrigger t) async {
+    if (!mgr.settings.autoReconnect) return;
+    while (attempt < delays.length + 5) {
+      try {
+        await mgr.connect();
+        attempt = 0;
+        return;
+      } catch (_) {
+        await Future.delayed(Duration(seconds: delays[attempt.clamp(0, delays.length-1)]));
+        attempt++;
+      }
+    }
+    mgr.emitError(AppError.reconnectExhausted);
+  }
+}Code Message
+E_SERVER_UNREACHABLE Unable to reach VPN server.
+E_AUTH_FAILED Authentication failed.
+E_CONFIG_INVALID VPN configuration is invalid.
+E_NO_NETWORK Network connection unavailable.
+E_SERVER_DOWN Server is currently unavailable.
+E_PERMISSION Permission required to establish the VPN connection.
+E_TUNNEL_LOST Connection lost. Attempting to reconnect.Phase Deliverable
+0 · Foundation (2 wks) Repo, CI, Dart interfaces, Flutter shell, backend skeleton
+1 · MVP Connect (4 wks) WireGuard connect/disconnect, dashboard, server list, auto-select
+2 · Robustness (3 wks) OpenVPN adapter, auto-reconnect, kill switch, DNS
+3 · Privacy & Accounts (3 wks) Auth, device registry, privacy page, opt-in diagnostics
+4 · Desktop parity (3 wks) Windows/macOS/Linux platform adapters, IKEv2 architecture
+5 · Hardening (3 wks) Fuzzing, soak tests, pen-test, SBOM, signed releases
+6 · Beta (ongoing) Closed beta, telemetry review, docs, roadmap for subscriptions
